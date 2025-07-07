@@ -79,6 +79,35 @@ validate_pin() {
     return 0
 }
 
+# Network troubleshooting function
+troubleshoot_network() {
+    print_info "Running network diagnostics..."
+    
+    # Check network interfaces
+    print_info "Active network interfaces:"
+    ip addr show | grep -E "(inet|UP|DOWN)" | head -10
+    
+    # Check default route
+    print_info "Default route:"
+    ip route show default
+    
+    # Check DNS resolution
+    print_info "DNS servers:"
+    cat /etc/resolv.conf | grep nameserver
+    
+    # Check if we can reach local gateway
+    local gateway=$(ip route show default | awk '/default/ { print $3 }')
+    if [[ -n "$gateway" ]]; then
+        if ping -c 1 -W 3 "$gateway" &> /dev/null; then
+            print_success "Can reach gateway: $gateway"
+        else
+            print_error "Cannot reach gateway: $gateway"
+        fi
+    fi
+    
+    print_info "Network diagnostics completed"
+}
+
 # Check system requirements
 check_system_requirements() {
     print_info "Checking system requirements..."
@@ -102,10 +131,60 @@ check_system_requirements() {
         exit 1
     fi
     
-    # Check internet connectivity
-    if ! ping -c 1 google.com &> /dev/null; then
-        print_error "No internet connection available."
-        exit 1
+    # Check internet connectivity with multiple methods
+    print_info "Testing internet connectivity..."
+    local internet_available=false
+    
+    # Method 1: Try ping to multiple reliable hosts
+    local test_hosts=("8.8.8.8" "1.1.1.1" "google.com" "ubuntu.com")
+    for host in "${test_hosts[@]}"; do
+        if ping -c 1 -W 3 "$host" &> /dev/null; then
+            internet_available=true
+            print_success "Internet connection verified via $host"
+            break
+        fi
+    done
+    
+    # Method 2: Try wget/curl if ping fails
+    if [[ "$internet_available" == false ]]; then
+        if command -v wget &> /dev/null; then
+            if wget --spider --timeout=10 --tries=1 https://google.com &> /dev/null; then
+                internet_available=true
+                print_success "Internet connection verified via wget"
+            fi
+        elif command -v curl &> /dev/null; then
+            if curl --connect-timeout 10 --max-time 15 -s https://google.com &> /dev/null; then
+                internet_available=true
+                print_success "Internet connection verified via curl"
+            fi
+        fi
+    fi
+    
+    # Method 3: Check if we can resolve DNS
+    if [[ "$internet_available" == false ]]; then
+        if nslookup google.com &> /dev/null || dig google.com &> /dev/null; then
+            internet_available=true
+            print_success "Internet connection verified via DNS lookup"
+        fi
+    fi
+    
+    if [[ "$internet_available" == false ]]; then
+        print_warning "Cannot verify internet connection, but continuing..."
+        print_info "Please ensure you have internet access for package downloads"
+        
+        # Offer network troubleshooting
+        read -p "Would you like to run network diagnostics? (y/N): " -n 1 -r
+        echo
+        if [[ $REPLY =~ ^[Yy]$ ]]; then
+            troubleshoot_network
+        fi
+        
+        read -p "Continue anyway? (y/N): " -n 1 -r
+        echo
+        if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+            print_error "Internet connection required for installation"
+            exit 1
+        fi
     fi
     
     print_success "System requirements check passed"
@@ -266,14 +345,31 @@ setup_rdp() {
     local username="$CREATED_USERNAME"
     print_info "Setting up Chrome Remote Desktop for user '$username'..."
     
-    # Update package list
+    # Update package list with retry logic
     print_info "Updating package repositories..."
-    if apt update; then
-        print_success "Package repositories updated"
-    else
-        print_error "Failed to update package repositories"
-        exit 1
-    fi
+    local max_retries=3
+    local retry_count=0
+    
+    while [[ $retry_count -lt $max_retries ]]; do
+        if apt update; then
+            print_success "Package repositories updated"
+            break
+        else
+            ((retry_count++))
+            if [[ $retry_count -lt $max_retries ]]; then
+                print_warning "Failed to update repositories, retrying... ($retry_count/$max_retries)"
+                sleep 5
+            else
+                print_error "Failed to update package repositories after $max_retries attempts"
+                print_info "This might be due to network issues or repository problems"
+                read -p "Continue anyway? (y/N): " -n 1 -r
+                echo
+                if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+                    exit 1
+                fi
+            fi
+        fi
+    done
     
     # Install Firefox ESR
     print_info "Installing Firefox ESR..."
